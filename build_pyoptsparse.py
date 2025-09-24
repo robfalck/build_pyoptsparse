@@ -807,7 +807,7 @@ def install_ipopt(config_opts:list=None):
 
     install_ipopt_from_src(config_opts=config_opts)
     if opts['pyoptsparse_version'] >= parse('2.14'):
-        pip_install(['cyipopt', '--use-pep517'], pkg_desc='cyipopt')
+        pip_install(['cyipopt'], pkg_desc='cyipopt')
 
 def install_mumps():
     """ Install MUMPS either through conda or building. """
