@@ -37,7 +37,8 @@ opts = {
     'pyoptsparse_version': None, # Parsed pyOptSparse version, set by finish_setup()
     'make_name': 'make',
     'fall_back': False,
-    'pip_cmd': 'pip'
+    'pip_cmd': 'pip',
+    'use_pixi': False
 }
 
 # Information about the host, status, and constants
@@ -188,6 +189,10 @@ def process_command_line():
     parser.add_argument("--pip-cmd",
                     help=f"pip command to use. Set to to --pip-cmd='uv pip' if using uv. Default: {opts['pip_cmd']}",
                     default=opts['pip_cmd'])
+    parser.add_argument("--pixi",
+                        help="Use pixi for environment management instead of conda/mamba.",
+                        action="store_true",
+                        default=opts['use_pixi'])
     parser.add_argument("-s", "--snopt-dir",
                         help="Include SNOPT from SNOPT-DIR. Default: no SNOPT",
                         default=opts['snopt_dir'])
@@ -214,12 +219,13 @@ def process_command_line():
     opts['include_paropt'] = args.paropt
     opts['include_ipopt'] = not args.no_ipopt
     build_info['pyoptsparse']['branch'] = args.branch
+    opts['use_pixi'] = args.pixi  # Set this early so we can skip conda checks
 
-    # Determine conda settings
+    # Determine conda settings (skip if using pixi)
     opts['ignore_conda'] = args.ignore_conda
     opts['ignore_mamba'] = args.ignore_mamba
 
-    if opts['ignore_conda'] is False and conda_is_active():
+    if opts['use_pixi'] is False and opts['ignore_conda'] is False and conda_is_active():
         if args.conda_cmd is not None:
             opts['conda_cmd'] = args.conda_cmd
         else:
@@ -1358,6 +1364,215 @@ def get_package_info(pkgname:str) -> dict:
     return info
 
 
+def run_pixi_cmd(cmd_args):
+    """
+    Shorthand for performing a pixi operation.
+
+    Parameters
+    ----------
+    cmd_args : list
+        Each token of the command line is a separate member of the list. The pixi
+        executable name is prepended, so should not be included in the list.
+
+    Returns
+    -------
+    subprocess.CompletedProcess
+        The result of the finished command.
+    """
+    cmd_list = ['pixi']
+    cmd_list.extend(cmd_args)
+    return run_cmd(cmd_list)
+
+
+def perform_install_pixi():
+    """
+    Install pyOptSparse using pixi for build environment management.
+    Creates a temporary pixi environment for building, then installs the result
+    via pip into the current Python environment.
+    """
+    process_command_line()
+    initialize()
+
+    # Check if pixi is available
+    if which('pixi') is None:
+        print(f"{red('ERROR')}: pixi command not found. Please install pixi first.")
+        print("Visit https://prefix.dev for installation instructions.")
+        exit(1)
+
+    announce('Building pyOptSparse using pixi build environment')
+
+    # Determine pyOptSparse version
+    pos_ver_str = build_info['pyoptsparse']['branch']
+    if pos_ver_str[:1] == 'v':
+        pos_ver_str = pos_ver_str[1:]
+    opts['pyoptsparse_version'] = parse(pos_ver_str)
+
+    # Remember the original Python and pip for final installation
+    original_python = sys.executable
+    original_pip_cmd = opts['pip_cmd']
+
+    # Create a temporary directory for the pixi build environment
+    if opts['keep_build_dir']:
+        pixi_build_dir = Path.cwd() / 'pyoptsparse_pixi_build'
+        pixi_build_dir.mkdir(exist_ok=True)
+        print(f"Creating pixi build environment in: {code(str(pixi_build_dir))}")
+    else:
+        pixi_build_dir = Path(tempfile.mkdtemp(prefix='pyoptsparse_pixi_build_'))
+        print(f"Creating temporary pixi build environment in: {code(str(pixi_build_dir))}")
+
+    # Change to pixi build directory
+    pushd(str(pixi_build_dir))
+
+    # Initialize pixi project for building
+    note('Initializing pixi build environment')
+    run_cmd(['pixi', 'init', '--channel', 'conda-forge'])
+    note_ok()
+
+    # Set prefix to the pixi environment location (for building)
+    build_prefix = str(pixi_build_dir / '.pixi' / 'envs' / 'default')
+    opts['prefix'] = build_prefix
+    print(f'Pixi build environment: {code(build_prefix)}')
+
+    # Build package list based on options
+    packages = []
+
+    # Base packages for building
+    packages.extend(['python', 'numpy', 'scipy', 'swig', 'cython', 'pip'])
+
+    # Compiler toolchain - use compilers package for consistency
+    packages.extend(['compilers', 'make', 'git', 'pkg-config'])
+
+    # Add linear algebra libraries
+    packages.extend(['openblas', 'lapack', 'blas'])
+
+    # Linear solver dependencies
+    if opts['linear_solver'] == 'mumps':
+        # Only add linux/mac compatible packages
+        if sys_info['sys_name'] != 'Windows':
+            packages.extend(['metis', 'mumps-include', 'mumps-seq', 'mumps-mpi', 'ipopt'])
+        else:
+            packages.extend(['ipopt'])
+            print(f"{yellow('WARNING')}: MUMPS packages may not be available on Windows. IPOPT will be installed without MUMPS.")
+    elif opts['linear_solver'] == 'hsl':
+        packages.extend(['metis'])
+        print(f"{yellow('NOTE')}: HSL linear solver requires manual source code.")
+        if opts['hsl_tar_file']:
+            print(f"The tar file will be used: {opts['hsl_tar_file']}")
+    elif opts['linear_solver'] == 'pardiso':
+        packages.append('ipopt')
+        print(f"{yellow('NOTE')}: PARDISO requires Intel MKL which should be available in environment.")
+
+    # ParOpt requires MPI
+    if opts['include_paropt']:
+        packages.extend(['openmpi', 'mpi4py'])
+
+    # Add cyipopt if needed for newer pyoptsparse versions
+    if opts['pyoptsparse_version'] >= parse('2.14'):
+        packages.append('cyipopt')
+
+    # Install all packages in one go
+    note(f'Installing {len(packages)} packages in build environment with pixi')
+    install_args = ['add'] + packages
+    run_pixi_cmd(cmd_args=install_args)
+    note_ok()
+
+    # Set up environment to use tools from pixi build environment
+    pixi_bin = str(Path(build_prefix) / 'bin')
+    os.environ['CC'] = str(Path(pixi_bin) / 'gcc')
+    os.environ['CXX'] = str(Path(pixi_bin) / 'g++')
+    os.environ['FC'] = str(Path(pixi_bin) / 'gfortran')
+    os.environ['PATH'] = pixi_bin + ':' + os.environ.get('PATH', '')
+
+    # Use pip from the pixi environment for building
+    opts['pip_cmd'] = str(Path(pixi_bin) / 'pip')
+
+    # Now get gcc version info
+    select_gnu_compilers()
+
+    # Now build from source as needed
+    if opts['linear_solver'] == 'hsl' and opts['hsl_tar_file']:
+        # HSL needs to be built from source
+        install_metis()
+        install_hsl_from_src()
+        coin_dir = get_coin_inc_dir()
+        install_ipopt_from_src(config_opts=[
+            '--with-hsl',
+            f'--with-hsl-lflags=-L{opts["prefix"]}/lib -lcoinhsl',
+            f'--with-hsl-cflags=-I{coin_dir}/hsl',
+            '--disable-linear-solver-loader'
+        ])
+
+    # Build pyOptSparse (but don't install yet)
+    if opts['build_pyoptsparse']:
+        # Clone and build pyOptSparse to create wheel
+        build_dir = git_clone('pyoptsparse', auto_delete=False)
+        build_dir_str = build_dir if isinstance(build_dir, str) else build_dir.name
+
+        if opts['include_ipopt'] is True:
+            os.environ['IPOPT_INC'] = get_coin_inc_dir()
+            os.environ['IPOPT_LIB'] = str(Path(opts["prefix"]) / 'lib')
+            os.environ['IPOPT_DIR'] = str(Path(opts["prefix"]))
+        os.environ['CFLAGS'] = '-Wno-implicit-function-declaration -std=c99'
+
+        # Pull in SNOPT source if needed
+        if opts['snopt_dir'] is not None:
+            copy_snopt_files(build_dir_str)
+
+        patch_pyoptsparse_src()
+
+        # Build wheel instead of installing directly
+        note('Building pyOptSparse wheel')
+        run_cmd([opts['pip_cmd'], 'wheel', '--no-deps', '-w', str(pixi_build_dir), './'])
+        note_ok()
+
+        # Find the wheel that was just built
+        wheels = list(pixi_build_dir.glob('pyoptsparse-*.whl'))
+        if not wheels:
+            print(f"{red('ERROR')}: No wheel file was created")
+            exit(1)
+
+        wheel_path = wheels[0]
+        print(f"Built wheel: {code(str(wheel_path))}")
+
+        popd()  # Exit pyOptSparse source directory
+
+    # Return to original directory
+    popd()  # Exit pixi build directory
+
+    # Now install the wheel into the original Python environment
+    if opts['build_pyoptsparse'] and wheels:
+        announce('Installing pyOptSparse into current Python environment')
+
+        note(f'Installing pyOptSparse wheel with {original_pip_cmd}')
+        install_cmd = original_pip_cmd.split() + ['install', str(wheel_path)]
+        if opts['verbose'] is False:
+            install_cmd.insert(2, '-q')
+        run_cmd(install_cmd)
+        note_ok()
+
+    # Clean up pixi build directory if requested
+    if not opts['keep_build_dir']:
+        note('Cleaning up pixi build environment')
+        import shutil
+        shutil.rmtree(pixi_build_dir)
+        note_ok()
+    else:
+        print(f"Pixi build environment preserved at: {code(str(pixi_build_dir))}")
+
+    # Success message
+    announce("The pyOptSparse installation is complete")
+
+    print(f"""
+{yellow('NOTE')}: pyOptSparse has been installed into your current Python environment.
+You can now use it with:
+
+{code(f'{original_python} -c "import pyoptsparse; print(pyoptsparse.__version__)"')}
+""")
+
+    announce('SUCCESS!')
+    exit(0)
+
+
 def perform_install():
     """ Initiate all the required actions in the script. """
 
@@ -1409,4 +1624,13 @@ def perform_install():
     post_build_success()
 
 if __name__ == "__main__":
-    perform_install()
+    # Parse args early to check for pixi flag
+    import argparse
+    parser = argparse.ArgumentParser(add_help=False)
+    parser.add_argument("--pixi", action="store_true", default=False)
+    args, _ = parser.parse_known_args()
+
+    if args.pixi:
+        perform_install_pixi()
+    else:
+        perform_install()
